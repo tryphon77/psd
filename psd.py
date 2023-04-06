@@ -14,6 +14,41 @@ write_resolution_info = True
 write_unicode_layer_name = True
 
 
+def load_png(path):
+	r = png.Reader(path)
+	w, h, arr, info = r.read()
+
+	# pal_ = [(r, g, b, 255) for r, g, b, in info['palette']]
+	# nc = len(pal_)
+	# pal_ += ((0, 0, 0, 0),) * (256 - nc)
+	# pal = np.array(pal_, dtype=np.uint8)
+	arr = np.array(list(arr), dtype=np.uint8)
+	arr.shape = (h, w*4)
+	
+	return arr
+
+def get_bounding_box(a):
+	array = a[:,:]
+	array.dtype = np.uint32
+	height, width = array.shape
+	top = 0
+	while top < height and not array[top, :].any():
+		top += 1
+ 			
+	left = 0
+	while left < width and not array[:, left].any():
+		left += 1
+ 			
+	bottom = height - 1
+	while bottom >= 0 and not array[bottom, :].any():
+		bottom -= 1
+ 			
+	right = width - 1
+	while right >= 0 and not array[:, right].any():
+		right -= 1
+	
+	return top, left, bottom, right
+
 def write_pascal_string(buf, s):
 	# Pascal String
 	# 1 byte : length of the string
@@ -60,28 +95,6 @@ class PsdChannel:
 		if compression == 0:
 			buf.write(self.data.flatten())
 	
-	
-	
-# 	def get_bounding_box(self):
-# 		top = 0
-# 		while top < self.height and not self.data[top, :].any():
-# 			top += 1
-# 			
-# 		left = 0
-# 		while left < self.width and not self.data[:, left].any():
-# 			left += 1
-# 			
-# 		bottom = self.height - 1
-# 		while bottom >= 0 and not self.data[bottom, :].any():
-# 			bottom -= 1
-# 			
-# 		right = self.width - 1
-# 		while right >= 0 and not self.data[:, right].any():
-# 			right -= 1
-# 		
-# 		print("channel bounding box : %d, %d, %d, %d" % (top, left, bottom, right))
-# 		return top, left, bottom, right
-
 	def __len__(self):
 		return self.height * self.width + 2
 
@@ -91,16 +104,32 @@ class PsdLayer():
 		offset = (0, 0),
 		size=None,
 		surface  = None,
-		channels = []
+		channels = [],
+		image = None
 	):
 		self.name = name
+
+		if image is not None:
+			top, left, _, _ = get_bounding_box(image)
+			x0, y0 = offset
+			offset = (x0 + left, y0 + top)
+			
+			self.channels = [
+				PsdChannel(-1, image[:, 3::4]),
+				PsdChannel(0, image[:, 2::4]),
+				PsdChannel(1, image[:, 1::4]),
+				PsdChannel(2, image[:, 0::4])
+			]
+
+		else:
+			self.channels = channels
+
 		self.offset = offset
-		self.channels = channels
-		self.nb_channels = len(channels)
+		self.nb_channels = len(self.channels)
 		self.is_visible = True
 		
 		if size is None:
-			w, h = channels[0].size
+			w, h = self.channels[0].size
 			self.size = (w, h)
 		else:
 			self.size = size
@@ -222,9 +251,9 @@ class PsdLayer():
 		
 class PsdFile():
 	def __init__(self, 
-		size, 
-		layers,
-		color_mode = 0,
+		size = (0, 0), 
+		layers = [],
+		color_mode = 3,
 		palette = None
 	):
 		self.size = size
@@ -233,12 +262,42 @@ class PsdFile():
 		self.color_mode = color_mode
 		self.palette = palette		
 	
+	def add_layer(self, layer):
+		assert type(layer) == PsdLayer
+		
+		self.layers.append(layer)
+		self.nb_layers += 1
+		
+		top, left, bottom, right = layer.get_bounding_box()
+		
+		width, height = self.size
+		width = max(width, right)
+		height = max(height, bottom)
+		self.size = (width, height)
+		
+		if top < 0 or right < 0:
+			print("Warning: lost data in layer [%s]" % layer.name)
+			
+	def remove_layer(self, layer):
+		self.layers.remove(layer)
+		self.nb_layers -= 1
+		
 	def get_by_name(self, name):
 		for layer in self.layers:
 			if layer.name == name:
 				return layer
-			raise Exception("Layer [%s] not found" % name)
+		raise Exception("Layer [%s] not found" % name)
 
+	@staticmethod
+	def from_images(images):
+		res = PsdFile()
+		
+		for path in images:
+			image = load_png(path)
+			res.add_layer(PsdLayer(name=path, image=image))
+		
+		return res
+			
 	def save(self, path):
 		buf = Buffer()
 		self.write_to_buffer(buf)
@@ -264,7 +323,7 @@ class PsdFile():
 			buf.write_w(1)
 		elif self.color_mode == 3:
 			buf.write_w(4)
-		
+
 		width, height = self.size
 		# 	The height of the image in pixels (4). Supported range is 1 to 30,000.
 		buf.write_l(height)
@@ -610,36 +669,38 @@ if __name__ == '__main__':
 
 		psd_file.save_fusioned_as_png("test/fusion.png")
 		
-	if False:
+	if True:
 		# create psd by adding layers
 		psd_file = PsdFile()
 		
 		# create layers
-		layer_1 = PsdLayer("Layer 1", (0, 0), image="layer01.png")
+		image_1 = load_png("test/layer01.png")
+		layer_1 = PsdLayer("Layer 1", (0, 0), image=image_1)
 		psd_file.add_layer(layer_1)
 
-		layer_2 = PsdLayer("Layer 2", (4, 0), image="layer02.png")
+		image_2 = load_png("test/layer02.png")
+		layer_2 = PsdLayer("Layer 2", (4, 0), image=image_2)
 		psd_file.add_layer(layer_2)
 		
-		layer_3 = PsdLayer("Layer 3", (0, 4), image="layer03.png")
+		image_3 = load_png("test/layer03.png")
+		layer_3 = PsdLayer("Layer 3", (0, 4), image=image_3)
 		psd_file.add_layer(layer_3)
 
-		psd_file.save("test.res2.psd")
+		image_4 = load_png("test/layer04.png")
+		layer_4 = PsdLayer("Layer 4", (4, 4), image=image_4)
+		psd_file.add_layer(layer_4)
 
-	if False:
+		psd_file.save("test/res2.psd")
+
+	if True:
 		# create psd by removing layers
 		psd_file = load_psd("test/test1.psd")
 		
-		psd_file.remove(psd_file.get_by_name("Calque 3"))
+		psd_file.remove_layer(psd_file.get_by_name("Calque 3"))
 
-		psd_file.save("test.res2.psd")
+		psd_file.save("test/res3.psd")
 	
-	if False:
+	if True:
 		# create quick psd file from png
-		psd_file = PsdFile.from_images(["layer01.png", "layer02.png", "layer03.png"])
-		psd_file.save("test.res2.psd")
-
-	if False:
-		# create quick psd file from PngArrays
-		pass
-			
+		psd_file = PsdFile.from_images(["test/layer01.png", "test/layer02.png", "test/layer03.png"])
+		psd_file.save("test/res4.psd")
