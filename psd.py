@@ -18,10 +18,6 @@ def load_png(path):
 	r = png.Reader(path)
 	w, h, arr, info = r.read()
 
-	# pal_ = [(r, g, b, 255) for r, g, b, in info['palette']]
-	# nc = len(pal_)
-	# pal_ += ((0, 0, 0, 0),) * (256 - nc)
-	# pal = np.array(pal_, dtype=np.uint8)
 	arr = np.array(list(arr), dtype=np.uint8)
 	arr.shape = (h, w*4)
 	
@@ -42,11 +38,14 @@ def get_bounding_box(a):
 	bottom = height - 1
 	while bottom >= 0 and not array[bottom, :].any():
 		bottom -= 1
- 			
+	bottom += 1
+	
 	right = width - 1
 	while right >= 0 and not array[:, right].any():
 		right -= 1
-	
+	right += 1
+
+	# print("get_bounding_box: top=%d left=%d bottom=%d right=%d" % (top, left, bottom, right))	
 	return top, left, bottom, right
 
 def write_pascal_string(buf, s):
@@ -86,7 +85,7 @@ class PsdChannel:
 		self.data = data
 		self.height, self.width = data.shape
 		self.size = (self.width, self.height)
-#		print("Channel %d: size=(%s)" % (self.id, self.size))
+		# print("Channel %d: size=(%s)" % (self.id, self.size))
 	
 	def write_data(self, buf, compression=0):
 		# @TODO : write RLE compressed data
@@ -107,19 +106,23 @@ class PsdLayer():
 		channels = [],
 		image = None
 	):
+		# print("PsdLayer")
 		self.name = name
 
 		if image is not None:
-			top, left, _, _ = get_bounding_box(image)
+			top, left, bottom, right = get_bounding_box(image)
 			x0, y0 = offset
 			offset = (x0 + left, y0 + top)
-			
+
+			cropped_image = image[top : bottom, 4*left : 4*right]				
 			self.channels = [
-				PsdChannel(-1, image[:, 3::4]),
-				PsdChannel(0, image[:, 2::4]),
-				PsdChannel(1, image[:, 1::4]),
-				PsdChannel(2, image[:, 0::4])
+				PsdChannel(-1, cropped_image[:, 3::4]),
+				PsdChannel(0, cropped_image[:, 2::4]),
+				PsdChannel(1, cropped_image[:, 1::4]),
+				PsdChannel(2, cropped_image[:, 0::4])
 			]
+			
+			size = (right - left, bottom - top)
 
 		else:
 			self.channels = channels
@@ -135,7 +138,7 @@ class PsdLayer():
 			self.size = size
 
 		self.color_mode = 3
-#		print("""Layer "%s": size=%s, offset=%s""" % (self.name, self.size, self.offset))
+		# print("""Layer "%s": size=%s, offset=%s""" % (self.name, self.size, self.offset))
 
 	def hide(self):
 		self.is_visible = False
@@ -263,6 +266,7 @@ class PsdFile():
 		self.palette = palette		
 	
 	def add_layer(self, layer):
+		# print("PsdFile.add_layer")
 		assert type(layer) == PsdLayer
 		
 		self.layers.append(layer)
@@ -271,9 +275,14 @@ class PsdFile():
 		top, left, bottom, right = layer.get_bounding_box()
 		
 		width, height = self.size
+
+		# print("add_layer: top=%d left=%d bottom=%d right=%d width=%d height=%d" % (top, left, bottom, right, width, height))
+
 		width = max(width, right)
 		height = max(height, bottom)
 		self.size = (width, height)
+		
+		# print("-> width=%d height=%d" % (width, height))
 		
 		if top < 0 or right < 0:
 			print("Warning: lost data in layer [%s]" % layer.name)
@@ -455,6 +464,7 @@ class PsdFile():
 
 		alpha_bits = 0xFF << (8*order.index("A"))		
 		for layer in self.layers:
+			# print("processing layer: [%s]" % layer.name)
 			if layer.is_visible:
 				top, left, bottom, right = layer.get_bounding_box()
 	
@@ -507,7 +517,7 @@ def _read_compressed_layer(buf, w, h):
 	unc.shape = (h, w)
 	
 	buf.restore_state()
-	return unc.T
+	return unc
 
 def load_psd(path):
 	source = Buffer.load(path)
@@ -532,13 +542,23 @@ def load_psd(path):
 #	color_mode_data_section = 0x1A
 	length = source.read_l()
 #	print("length of color mode data section: %d" % length)
-	source.advance_index_by(length)
+	if length and length != 768:
+		raise Exception("Unsupported color mode")
+	if pic_color_mode == 2:
+		pic_palette = np.zeros((256, 4), dtype=np.uint8)
+		for x in range(256):
+			pic_palette[x, 0] = 0xFF
+			pic_palette[x, 1] = source.read_b()
+			pic_palette[x, 2] = source.read_b()
+			pic_palette[x, 3] = source.read_b()
+		
+#	source.advance_index_by(length)
 
 	image_ressource_section = source.index
 #	print("image ressource section starts at %X" % image_ressource_section)
 	
 	layer_info_section = image_ressource_section + source.read_l(image_ressource_section) + 4
-#	 print("layer info section starts at %X" % layer_info_section)
+#	print("layer info section starts at %X" % layer_info_section)
 	
 	source.set_index(layer_info_section + 8)
 	nb_layers = source.read_w()
@@ -553,7 +573,7 @@ def load_psd(path):
 		bottom = source.read_l()
 		right = source.read_l()
 		
-#		 print 'rect =', (y0, x0, y1, x1)
+#		print("bounding_box: top=%d left=%d bottom=%d right=%d" % (top, left, bottom, right))
 		layer['rect'] = (top, left, bottom, right)
 		
 		nb_channels = source.read_w() # nb_channels
@@ -615,17 +635,24 @@ def load_psd(path):
 		h = bottom - top
 		
 		channels = []
-		for j in range(4):
-#			 print("layer %d channel %d starts at %X" % (i, j, source.index))
-			is_compressed = source.read_w()
-			if is_compressed == 1:
-				channels += [PsdChannel(j - 1, _read_compressed_layer(source, w, h))]
-			elif is_compressed == 0:
-				channels += [PsdChannel(j - 1, _read_uncompressed_layer(source, w, h))]
-			else:
-				raise Exception("bad compression flag at %X" % (source.index - 2))
-
-			source.advance_index_by(layer['channel_sizes'][j] - 2)
+		if pic_color_mode == 2:
+			# indexed colors
+			raise Exception()
+		
+		elif pic_color_mode == 3:
+			for j in range(4):
+#				print("layer %d channel %d starts at %X" % (i, j, source.index))
+				is_compressed = source.read_w()
+				if is_compressed == 1:
+#					print("compressed data")
+					channels += [PsdChannel(j - 1, _read_compressed_layer(source, w, h))]
+				elif is_compressed == 0:
+#					print("uncompressed data")
+					channels += [PsdChannel(j - 1, _read_uncompressed_layer(source, w, h))]
+				else:
+					raise Exception("bad compression flag at %X" % (source.index - 2))
+	
+				source.advance_index_by(layer['channel_sizes'][j] - 2)
 	
 		result += [
 			PsdLayer(
@@ -654,8 +681,6 @@ if __name__ == '__main__':
 		for layer in psd_file.layers:
 			layer.save_as_png("test/test1-%s.png" % layer.name, crop=True)
 		
-		# save fusioned png
-
 	if True:
 		# load a psd file
 		psd_file = load_psd('test/test1.psd')
